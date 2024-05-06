@@ -1,11 +1,30 @@
-import os
+# Copyright © 2024 Apple Inc.
+
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
 
 
 @dataclass
@@ -35,8 +54,12 @@ class TrainingArgs:
         default=2048, metadata={"help": "Maximum sequence length."}
     )
     adapter_file: str = field(
-        default="adapter.npz",
+        default="adapters.safetensors",
         metadata={"help": "Save/load path for the trained adapter weights."},
+    )
+    grad_checkpoint: bool = field(
+        default=False,
+        metadata={"help": "Use gradient checkpointing to reduce memory use."},
     )
 
 
@@ -54,16 +77,24 @@ def default_loss(model, inputs, targets, lengths):
 
 
 def iterate_batches(dataset, tokenizer, batch_size, max_seq_length, train=False):
+    # Sort by length:
+    idx = sorted(range(len(dataset)), key=lambda idx: len(dataset[idx]))
+    if len(dataset) < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size}"
+            f" examples but only has {len(dataset)}."
+        )
+
+    # Make the batches:
+    batch_idx = [
+        idx[i : i + batch_size] for i in range(0, len(idx) - batch_size + 1, batch_size)
+    ]
+
     while True:
-        # Shuffle indices
-        indices = np.arange(len(dataset))
-        indices = np.random.permutation(indices)
-        # Collect batches from dataset
-        for i in range(0, len(indices) - batch_size + 1, batch_size):
+        indices = np.random.permutation(len(batch_idx))
+        for i in indices:
             # Encode batch
-            batch = [
-                tokenizer.encode(dataset[indices[i + j]]) for j in range(batch_size)
-            ]
+            batch = [tokenizer.encode(dataset[j]) for j in batch_idx[i]]
             lengths = [len(x) for x in batch]
 
             if max(lengths) > max_seq_length:
@@ -73,8 +104,11 @@ def iterate_batches(dataset, tokenizer, batch_size, max_seq_length, train=False)
                     "Consider pre-splitting your data to save memory."
                 )
 
-            # Pad to the max length
-            max_length_in_batch = min(max(lengths), max_seq_length)
+            # Pad to the nearest multiple of 8 or the maximum length
+            pad_to = 8
+            max_length_in_batch = pad_to * ((max(lengths) + pad_to - 1) // pad_to)
+            max_length_in_batch = min(max_length_in_batch, max_seq_length)
+
             batch_arr = np.zeros((batch_size, max_length_in_batch), np.int32)
 
             for j in range(batch_size):
@@ -103,8 +137,11 @@ def evaluate(
 ):
     all_losses = []
     ntokens = 0
-    for it, batch in zip(
-        range(num_batches),
+
+    index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
+
+    for _, batch in zip(
+        index_iterator,
         iterate_batches(
             dataset=dataset,
             tokenizer=tokenizer,
@@ -143,11 +180,20 @@ def train(
 ):
     print(f"Starting training..., iters: {args.iters}")
 
-    # Create checkpoints directory if it does not exist
-    if not os.path.exists("checkpoints"):
-        os.makedirs("checkpoints")
+    if args.grad_checkpoint:
+        grad_checkpoint(model.layers[0])
 
-    # Create value and grad function for loss
+    state = [model.state, optimizer.state]
+
+    def step(batch):
+        # Forward and backward pass
+        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
+
+        # Model update
+        optimizer.update(model, grad)
+
+        return lvalue, toks
+
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
     losses = []
@@ -156,7 +202,7 @@ def train(
     # Main training loop
     start = time.perf_counter()
     for it, batch in zip(
-        range(args.iters),
+        range(1, args.iters + 1),
         iterate_batches(
             dataset=train_dataset,
             tokenizer=tokenizer,
@@ -165,20 +211,15 @@ def train(
             train=True,
         ),
     ):
-        # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
-
-        # Model update
-        optimizer.update(model, grad)
-
-        mx.eval(model.parameters(), optimizer.state, lvalue)
+        lvalue, toks = step(batch)
+        mx.eval(state, lvalue, toks)
 
         # Record loss
         losses.append(lvalue.item())
         n_tokens += toks.item()
 
         # Report training loss if needed
-        if (it + 1) % args.steps_per_report == 0:
+        if it % args.steps_per_report == 0 or it == args.iters:
             train_loss = np.mean(losses)
 
             stop = time.perf_counter()
@@ -186,22 +227,25 @@ def train(
             it_sec = args.steps_per_report / (stop - start)
             tokens_sec = float(n_tokens) / (stop - start)
             trained_tokens += n_tokens
+            peak_mem = mx.metal.get_peak_memory() / 2**30
             print(
-                f"Iter {it + 1}: Train loss {train_loss:.3f}, "
+                f"Iter {it}: Train loss {train_loss:.3f}, "
                 f"Learning Rate {learning_rate:.3e}, "
                 f"It/sec {it_sec:.3f}, "
                 f"Tokens/sec {tokens_sec:.3f}, "
-                f"Trained Tokens {trained_tokens}"
+                f"Trained Tokens {trained_tokens}, "
+                f"Peak mem {peak_mem:.3f} GB"
             )
 
             if training_callback is not None:
                 train_info = {
-                    "iteration": it + 1,
+                    "iteration": it,
                     "train_loss": train_loss,
                     "learning_rate": learning_rate,
                     "iterations_per_second": it_sec,
                     "tokens_per_second": tokens_sec,
                     "trained_tokens": trained_tokens,
+                    "peak_memory": peak_mem,
                 }
                 training_callback.on_train_loss_report(train_info)
 
@@ -210,7 +254,7 @@ def train(
             start = time.perf_counter()
 
         # Report validation loss if needed
-        if it == 0 or (it + 1) % args.steps_per_eval == 0:
+        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             stop = time.perf_counter()
             val_loss = evaluate(
                 model=model,
@@ -224,14 +268,12 @@ def train(
             )
             val_time = time.perf_counter() - stop
             print(
-                f"Iter {it + 1}: "
-                f"Val loss {val_loss:.3f}, "
-                f"Val took {val_time:.3f}s"
+                f"Iter {it}: " f"Val loss {val_loss:.3f}, " f"Val took {val_time:.3f}s"
             )
 
             if training_callback is not None:
                 val_info = {
-                    "iteration": it + 1,
+                    "iteration": it,
                     "val_loss": val_loss,
                     "val_time": val_time,
                 }
@@ -239,23 +281,26 @@ def train(
 
             start = time.perf_counter()
 
-        # Save adapter weights if needed
-        if (it + 1) % args.steps_per_save == 0:
-            checkpoint_adapter_file = f"checkpoints/{it + 1}_{args.adapter_file}"
-            save_adapter(model=model, adapter_file=checkpoint_adapter_file)
+        # Save adapter weights
+        if it % args.steps_per_save == 0:
+            save_adapter(model, args.adapter_file)
+            checkpoint = (
+                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+            )
+            save_adapter(model, checkpoint)
             print(
-                f"Iter {it + 1}: Saved adapter weights to {os.path.join(checkpoint_adapter_file)}."
+                f"Iter {it}: Saved adapter weights to "
+                f"{args.adapter_file} and {checkpoint}."
             )
 
     # save final adapter weights
-    save_adapter(model=model, adapter_file=args.adapter_file)
-    print(f"Saved final adapter weights to {os.path.join(args.adapter_file)}.")
+    save_adapter(model, args.adapter_file)
+    print(f"Saved final adapter weights to {args.adapter_file}.")
 
 
 def save_adapter(
     model: nn.Module,
-    adapter_file: str,
+    adapter_file: Union[str, Path],
 ):
     flattened_tree = tree_flatten(model.trainable_parameters())
-
-    mx.savez(adapter_file, **dict(flattened_tree))
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))

@@ -6,23 +6,37 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-from .layers import LayerNorm
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    max_position_embeddings: int
     model_type: str
     vocab_size: int
     hidden_size: int
     num_attention_heads: int
     num_hidden_layers: int
     num_key_value_heads: int
-    rope_pct: float
     intermediate_size: int
-    norm_eps: float
     rope_theta: float
     use_qkv_bias: bool
+    partial_rotary_factor: float
+    layer_norm_eps: float
+    use_parallel_residual: bool = False
+    qk_layernorm: bool = False
+
+
+class LayerNormPerHead(nn.Module):
+
+    def __init__(self, head_dim, num_heads, eps):
+        super().__init__()
+        self.norms = [
+            nn.LayerNorm(head_dim, eps=eps, bias=False) for _ in range(num_heads)
+        ]
+        self.eps = eps
+
+    def __call__(self, x):
+        w = mx.stack([n.weight for n in self.norms])
+        return w * mx.fast.layer_norm(x, None, None, self.eps)
 
 
 class Attention(nn.Module):
@@ -33,9 +47,8 @@ class Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.repeats = self.num_heads // self.num_key_value_heads
         self.rope_theta = config.rope_theta
-        self.rope_pct = config.rope_pct
+        self.partial_rotary_factor = config.partial_rotary_factor
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -61,10 +74,19 @@ class Attention(nn.Module):
         )
 
         self.rope = nn.RoPE(
-            int(self.rope_pct * self.head_dim),
+            int(self.partial_rotary_factor * self.head_dim),
             traditional=False,
             base=self.rope_theta,
         )
+
+        self.qk_layernorm = config.qk_layernorm
+        if self.qk_layernorm:
+            self.q_layernorm = LayerNormPerHead(
+                self.head_dim, self.num_heads, eps=config.layer_norm_eps
+            )
+            self.k_layernorm = LayerNormPerHead(
+                self.head_dim, self.num_key_value_heads, eps=config.layer_norm_eps
+            )
 
     def __call__(self, x, mask=None, cache=None):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -72,20 +94,16 @@ class Attention(nn.Module):
         # Extract some shapes
         B, L, D = queries.shape
 
-        # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(
+        queries = queries.reshape(B, L, self.num_heads, -1)
+        keys = keys.reshape(B, L, self.num_key_value_heads, -1)
+        if self.qk_layernorm:
+            queries = self.q_layernorm(queries)
+            keys = self.k_layernorm(keys)
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
-        keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        values = values.reshape(
-            B, L, self.num_key_value_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
-
-        if self.repeats > 1:
-            keys = mx.repeat(keys, self.repeats, axis=1)
-            values = mx.repeat(values, self.repeats, axis=1)
 
         # Add RoPE to the queries and keys and combine them with the cache
         if cache is not None:
@@ -103,14 +121,11 @@ class Attention(nn.Module):
 
         # Finally perform the attention computation
         scale = math.sqrt(1 / queries.shape[-1])
-        scores = (queries * scale) @ keys.transpose(0, 1, 3, 2)
-        if mask is not None:
-            scores = scores + mask
-
-        scores = mx.softmax(scores, axis=-1).astype(values.dtype)
-        values_hat = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
-
-        return self.o_proj(values_hat), (keys, values)
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask
+        ).astype(values.dtype)
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output), (keys, values)
 
 
 class MLP(nn.Module):
@@ -128,18 +143,28 @@ class DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.self_attn = Attention(config=config)
-        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = MLP(config.hidden_size, config.intermediate_size)
-        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.norm_eps)
-        self.post_attention_layernorm = LayerNorm(
-            config.hidden_size, eps=config.norm_eps
+        self.input_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_eps,
         )
+        self.use_parallel_residual = config.use_parallel_residual
+        if not self.use_parallel_residual:
+            self.post_attention_layernorm = nn.LayerNorm(
+                config.hidden_size,
+                eps=config.layer_norm_eps,
+            )
 
     def __call__(self, x, mask, cache):
-        r, cache = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
+        h = self.input_layernorm(x)
+        r, cache = self.self_attn(h, mask, cache)
+
+        if self.use_parallel_residual:
+            out = x + r + self.mlp(h)
+        else:
+            h = x + r
+            r = self.mlp(self.post_attention_layernorm(h))
+            out = h + r
         return out, cache
 
 
@@ -148,7 +173,7 @@ class StableLM(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [DecoderLayer(config) for i in range(config.num_hidden_layers)]
-        self.norm = LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def __call__(self, x, mask, cache):
         x = self.embed_tokens(x)

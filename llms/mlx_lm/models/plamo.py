@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from .base import BaseModelArgs
-from .layers import RMSNorm
 
 
 @dataclass
@@ -18,7 +17,7 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    n_shared_head: int = (8,)
+    n_shared_head: int = 8
     rope_theta: float = 10000
     rope_traditional: bool = False
 
@@ -80,16 +79,8 @@ class Attention(nn.Module):
             bsz, q_len, self.v_num_heads, self.v_dim
         ).transpose(0, 2, 1, 3)
 
-        def _expand_kv(a: mx.array) -> mx.array:
-            a = mx.concatenate(
-                [mx.expand_dims(a, 1)] * self.config.n_shared_head, axis=1
-            )
-            return a.reshape([bsz, self.q_num_heads, q_len, -1])
-
         # expand shared kv
         assert self.k_num_heads == self.v_num_heads
-        key_states = _expand_kv(key_states)
-        value_states = _expand_kv(value_states)
 
         kv_seq_len = 0
         if cache is not None:
@@ -102,12 +93,14 @@ class Attention(nn.Module):
             key_states = mx.concatenate([cache[0], key_states], axis=2)
             value_states = mx.concatenate([cache[1], value_states], axis=2)
 
-        scores = (query_states * self.scale) @ key_states.transpose(0, 1, 3, 2)
-        if attention_mask is not None:
-            scores += attention_mask
-        scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-        output = (scores @ value_states).transpose(0, 2, 1, 3).reshape(bsz, q_len, -1)
-
+        output = mx.fast.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            scale=self.scale,
+            mask=attention_mask,
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(bsz, q_len, -1)
         return self.o_proj(output), (key_states, value_states)
 
 
@@ -132,7 +125,7 @@ class PlamoDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = Attention(config)
         self.mlp = MLP(config)
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -175,7 +168,7 @@ class PlamoModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = PlamoDecoder(config)  # type: ignore
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -190,11 +183,7 @@ class PlamoModel(nn.Module):
             mask = mask.astype(self.embed_tokens.weight.dtype)
 
         if cache is None:
-            past_key_values_length = 0
             cache = [None for _ in range(len(self.layers.layers))]
-        else:
-            if cache[0] is not None:
-                past_key_values_length = cache[0][0].shape[2]
 
         for e, layer in enumerate(self.layers.layers):
             h, c = layer(h, mask, cache[e])
@@ -222,3 +211,7 @@ class Model(nn.Module):
     ) -> Tuple[mx.array, mx.array]:
         out, cache = self.model(inputs, cache)
         return self.lm_head(out), cache
+
+    @property
+    def layers(self):
+        return self.model.layers.layers

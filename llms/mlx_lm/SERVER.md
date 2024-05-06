@@ -4,16 +4,20 @@ You use `mlx-lm` to make an HTTP API for generating text with any supported
 model. The HTTP API is intended to be similar to the [OpenAI chat
 API](https://platform.openai.com/docs/api-reference).
 
+> [!NOTE]  
+> The MLX LM server is not recommended for production as it only implements
+> basic security checks.
+
 Start the server with: 
 
 ```shell
-python -m mlx_lm.server --model <path_to_model_or_hf_repo>
+mlx_lm.server --model <path_to_model_or_hf_repo>
 ```
 
 For example:
 
 ```shell
-python -m mlx_lm.server --model mistralai/Mistral-7B-Instruct-v0.1
+mlx_lm.server --model mistralai/Mistral-7B-Instruct-v0.1
 ```
 
 This will start a text generation server on port `8080` of the `localhost`
@@ -23,7 +27,7 @@ Hugging Face repo if it is not already in the local cache.
 To see a full list of options run:
 
 ```shell
-python -m mlx_lm.server --help
+mlx_lm.server --help
 ```
 
 You can make a request to the model by running:
@@ -61,3 +65,12 @@ curl localhost:8080/v1/chat/completions \
 
 - `top_p`: (Optional) A float specifying the nucleus sampling parameter.
   Defaults to `1.0`.
+
+- `repetition_penalty`: (Optional) Applies a penalty to repeated tokens.
+  Defaults to `1.0`.
+
+- `repetition_context_size`: (Optional) The size of the context window for
+  applying repetition penalty. Defaults to `20`.
+
+- `logit_bias`: (Optional) A dictionary mapping token IDs to their bias
+  values. Defaults to `None`.

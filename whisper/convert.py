@@ -1,4 +1,4 @@
-# Copyright © 2023 Apple Inc.
+# Copyright © 2023-2024 Apple Inc.
 
 import argparse
 import copy
@@ -16,10 +16,9 @@ import mlx.nn as nn
 import numpy as np
 import torch
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx_whisper import torch_whisper
+from mlx_whisper.whisper import ModelDimensions, Whisper
 from tqdm import tqdm
-
-from whisper import torch_whisper
-from whisper.whisper import ModelDimensions, Whisper
 
 _VALID_DTYPES = {"float16", "float32"}
 
@@ -91,7 +90,8 @@ def _download(url: str, root: str) -> str:
                 output.write(buffer)
                 loop.update(len(buffer))
 
-    model_bytes = open(download_target, "rb").read()
+    with open(download_target, "rb") as fid:
+        model_bytes = fid.read()
     if hashlib.sha256(model_bytes).hexdigest() != expected_sha256:
         raise RuntimeError(
             "Model has been downloaded but the SHA256 checksum does not not match. Please retry loading the model."
@@ -253,7 +253,7 @@ def quantize(weights, config, args):
     model.update(tree_unflatten(list(weights.items())))
 
     # Quantize the model:
-    nn.QuantizedLinear.quantize_module(model, args.q_group_size, args.q_bits)
+    nn.quantize(model, args.q_group_size, args.q_bits)
 
     # Update the config:
     quantized_config["quantization"] = {
